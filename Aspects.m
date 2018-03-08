@@ -128,7 +128,7 @@ static id aspect_add(id self, SEL selector, AspectOptions options, id block, NSE
                 [aspectContainer addAspect:identifier withOptions:options];
 
                 // Modify the class to allow message interception.
-                aspect_prepareClassAndHookSelector(self, selector, error);
+                aspect_prepareClassAndHookSelector(self, selector,options, error);
             }
         }
     });
@@ -191,13 +191,21 @@ static NSMethodSignature *aspect_blockMethodSignature(id block, NSError **error)
 	return [NSMethodSignature signatureWithObjCTypes:signature];
 }
 
-static BOOL aspect_isCompatibleBlockSignature(NSMethodSignature *blockSignature, id object, SEL selector, NSError **error) {
+static NSMethodSignature* aspect_methodSignatureForSelector(id object, SEL selector, AspectOptions options) {
+    NSMethodSignature *methodSignature = [[object class] instanceMethodSignatureForSelector:selector];
+    if (!methodSignature || (options & AspectOptionPreferClassMethod)) {
+        methodSignature = [[object class] methodSignatureForSelector:selector] ?: methodSignature;
+    }
+    return methodSignature;
+}
+
+static BOOL aspect_isCompatibleBlockSignature(NSMethodSignature *blockSignature, id object, SEL selector, AspectOptions options, NSError **error) {
     NSCParameterAssert(blockSignature);
     NSCParameterAssert(object);
     NSCParameterAssert(selector);
 
     BOOL signaturesMatch = YES;
-    NSMethodSignature *methodSignature = [[object class] instanceMethodSignatureForSelector:selector];
+    NSMethodSignature *methodSignature = aspect_methodSignatureForSelector(object, selector, options);
     if (blockSignature.numberOfArguments > methodSignature.numberOfArguments) {
         signaturesMatch = NO;
     }else {
@@ -229,6 +237,17 @@ static BOOL aspect_isCompatibleBlockSignature(NSMethodSignature *blockSignature,
     return YES;
 }
 
+static BOOL aspect_isClassMethod(Class klass, SEL selector, AspectOptions options) {
+   BOOL hasInstanceMethod = [klass instancesRespondToSelector:selector];
+   BOOL hasClassMethod = [klass respondsToSelector:selector];
+   BOOL prefersClassMethod = (options & AspectOptionPreferClassMethod) > 0;
+   return (prefersClassMethod && hasClassMethod) || (!hasInstanceMethod && hasClassMethod);
+}
+
+static Method aspect_getInstanceOrClassMethod(Class klass, SEL s, BOOL isClassMethod) {
+   return isClassMethod ? class_getClassMethod(klass, s) : class_getInstanceMethod(klass, s);
+}
+
 ///////////////////////////////////////////////////////////////////////////////////////////
 #pragma mark - Class + Selector Preparation
 
@@ -240,14 +259,14 @@ static BOOL aspect_isMsgForwardIMP(IMP impl) {
     ;
 }
 
-static IMP aspect_getMsgForwardIMP(NSObject *self, SEL selector) {
+static IMP aspect_getMsgForwardIMP(Method method) {
     IMP msgForwardIMP = _objc_msgForward;
 #if !defined(__arm64__)
     // As an ugly internal runtime implementation detail in the 32bit runtime, we need to determine of the method we hook returns a struct or anything larger than id.
     // https://developer.apple.com/library/mac/documentation/DeveloperTools/Conceptual/LowLevelABI/000-Introduction/introduction.html
     // https://github.com/ReactiveCocoa/ReactiveCocoa/issues/783
     // http://infocenter.arm.com/help/topic/com.arm.doc.ihi0042e/IHI0042E_aapcs.pdf (Section 5.4)
-    Method method = class_getInstanceMethod(self.class, selector);
+//    Method method = class_getInstanceMethod(self.class, selector);
     const char *encoding = method_getTypeEncoding(method);
     BOOL methodReturnsStructValue = encoding[0] == _C_STRUCT_B;
     if (methodReturnsStructValue) {
@@ -267,23 +286,30 @@ static IMP aspect_getMsgForwardIMP(NSObject *self, SEL selector) {
     return msgForwardIMP;
 }
 
-static void aspect_prepareClassAndHookSelector(NSObject *self, SEL selector, NSError **error) {
+static void aspect_prepareClassAndHookSelector(NSObject *self, SEL selector,AspectOptions options , NSError **error) {
     NSCParameterAssert(selector);
-    Class klass = aspect_hookClass(self, error);
-    Method targetMethod = class_getInstanceMethod(klass, selector);
-    IMP targetMethodIMP = method_getImplementation(targetMethod);
+    BOOL isClassMethod = aspect_isClassMethod([self class], selector, options);
+    Class hookedClass = aspect_hookClass(self, isClassMethod, error);
+//    Class klass = aspect_hookClass(self, error);
+//    Method targetMethod = class_getInstanceMethod(klass, selector);
+    Method method = aspect_getInstanceOrClassMethod(hookedClass, selector, isClassMethod);
+    NSCAssert(method, @"We must be able to get the method.");
+    IMP targetMethodIMP = method_getImplementation(method);
     if (!aspect_isMsgForwardIMP(targetMethodIMP)) {
         // Make a method alias for the existing method implementation, it not already copied.
-        const char *typeEncoding = method_getTypeEncoding(targetMethod);
+        const char *typeEncoding = method_getTypeEncoding(method);
         SEL aliasSelector = aspect_aliasForSelector(selector);
-        if (![klass instancesRespondToSelector:aliasSelector]) {
-            __unused BOOL addedAlias = class_addMethod(klass, aliasSelector, method_getImplementation(targetMethod), typeEncoding);
-            NSCAssert(addedAlias, @"Original implementation for %@ is already copied to %@ on %@", NSStringFromSelector(selector), NSStringFromSelector(aliasSelector), klass);
+        if (isClassMethod && ![hookedClass respondsToSelector:aliasSelector]) {
+            __unused BOOL addedAlias = class_addMethod(hookedClass, aliasSelector, method_getImplementation(method), typeEncoding);
+            NSCAssert(addedAlias, @"Original implementation for %@ is already copied to %@ on %@", NSStringFromSelector(selector), NSStringFromSelector(aliasSelector), hookedClass);
+        }else if (!isClassMethod && ![hookedClass instancesRespondToSelector:aliasSelector] ) {
+            __unused BOOL addedAlias = class_addMethod(hookedClass, aliasSelector, method_getImplementation(method), typeEncoding);
+            NSCAssert(addedAlias, @"Original implementation for %@ is already copied to %@ on %@", NSStringFromSelector(selector), NSStringFromSelector(aliasSelector), hookedClass);
         }
 
         // We use forwardInvocation to hook in.
-        class_replaceMethod(klass, selector, aspect_getMsgForwardIMP(self, selector), typeEncoding);
-        AspectLog(@"Aspects: Installed hook for -[%@ %@].", klass, NSStringFromSelector(selector));
+        class_replaceMethod(hookedClass, selector, aspect_getMsgForwardIMP(method), typeEncoding);
+        AspectLog(@"Aspects: Installed hook for -[%@ %@].", hookedClass, NSStringFromSelector(selector));
     }
 }
 
@@ -347,7 +373,7 @@ static void aspect_cleanupHookedClassAndSelector(NSObject *self, SEL selector) {
 ///////////////////////////////////////////////////////////////////////////////////////////
 #pragma mark - Hook Class
 
-static Class aspect_hookClass(NSObject *self, NSError **error) {
+static Class aspect_hookClass(NSObject *self,BOOL isClassMethod, NSError **error) {
     NSCParameterAssert(self);
 	Class statedClass = self.class;
 	Class baseClass = object_getClass(self);
@@ -359,7 +385,8 @@ static Class aspect_hookClass(NSObject *self, NSError **error) {
 
         // We swizzle a class object, not a single object.
 	}else if (class_isMetaClass(baseClass)) {
-        return aspect_swizzleClassInPlace((Class)self);
+        return aspect_swizzleClassInPlace(isClassMethod ? baseClass : (Class)self);
+//        return aspect_swizzleClassInPlace((Class)self);
         // Probably a KVO'ed class. Swizzle in place. Also swizzle meta classes in place.
     }else if (statedClass != baseClass) {
         return aspect_swizzleClassInPlace(baseClass);
@@ -433,9 +460,17 @@ static void _aspect_modifySwizzledClasses(void (^block)(NSMutableSet *swizzledCl
     }
 }
 
+static NSString *aspect_getClassName(Class klass) {
+    NSString *className = NSStringFromClass(klass);
+    if (class_isMetaClass(klass)) {
+        className = [className stringByAppendingString:@"__aspect_metaclass__"];
+    }
+    return className;
+}
+
 static Class aspect_swizzleClassInPlace(Class klass) {
     NSCParameterAssert(klass);
-    NSString *className = NSStringFromClass(klass);
+    NSString *className = aspect_getClassName(klass);
 
     _aspect_modifySwizzledClasses(^(NSMutableSet *swizzledClasses) {
         if (![swizzledClasses containsObject:className]) {
@@ -448,7 +483,7 @@ static Class aspect_swizzleClassInPlace(Class klass) {
 
 static void aspect_undoSwizzleClassInPlace(Class klass) {
     NSCParameterAssert(klass);
-    NSString *className = NSStringFromClass(klass);
+    NSString *className = aspect_getClassName(klass);
 
     _aspect_modifySwizzledClasses(^(NSMutableSet *swizzledClasses) {
         if ([swizzledClasses containsObject:className]) {
@@ -811,7 +846,7 @@ static void aspect_deregisterTrackedSelector(id self, SEL selector) {
     NSCParameterAssert(block);
     NSCParameterAssert(selector);
     NSMethodSignature *blockSignature = aspect_blockMethodSignature(block, error); // TODO: check signature compatibility, etc.
-    if (!aspect_isCompatibleBlockSignature(blockSignature, object, selector, error)) {
+    if (!aspect_isCompatibleBlockSignature(blockSignature, object, selector, options,error)) {
         return nil;
     }
 
